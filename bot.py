@@ -1,674 +1,552 @@
+# -*- coding: utf-8 -*-
+"""
+WorkHab — Telegram бот контент-завода для Instagram.
+Принимает видео/фото → генерирует Reels-пакет через ИИ.
+"""
 import os
-import asyncio
-import tempfile
-import subprocess
 import json
-import math
-import requests
+import subprocess
 from pathlib import Path
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from telegram.constants import ParseMode
 
-# ── CONFIG ───────────────────────────────────────────────────────
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes,
+)
+from telegram.constants import ParseMode, ChatAction
+
+# ─────────────────────────── КОНФИГ ───────────────────────────
 BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
 AI_API_KEY   = os.getenv("AI_API_KEY", "")
 AI_BASE_URL  = os.getenv("AI_BASE_URL", "https://api.aitunnel.ru/v1/messages")
 AI_MODEL     = os.getenv("AI_MODEL", "claude-sonnet-4-6")
 ALLOWED_USER = int(os.getenv("ALLOWED_USER_ID", "0"))
-WORK_DIR     = Path(os.getenv("WORK_DIR", "/tmp/content_factory"))
+MAIN_ACCOUNT = os.getenv("MAIN_ACCOUNT", "@workhab")
+
+WORK_DIR = Path("/tmp/workhab")
 WORK_DIR.mkdir(exist_ok=True)
 
-SYSTEM_PROMPT = """Ты ИИ-ассистент контент-завода для Instagram строительной компании WorkHab.
-Главный аккаунт: @workhab. Регион: Московская область.
-Ниши: кровля, фасады, капремонт МКД, ФКР МО.
-Цель: 1 миллион подписчиков за 12 месяцев через 30 сателлитных аккаунтов.
-Аудитория: русскоязычная. Стиль: живой, экспертный, без канцелярита.
-Всегда упоминай @workhab в CTA.
-Instagram 2025-2026: семантика важнее хэштегов. Закладки = главный сигнал охвата."""
+SYSTEM_PROMPT = (
+    "Ты ИИ-ассистент контент-завода WorkHab для Instagram строительной тематики.\n"
+    f"Главный аккаунт: {MAIN_ACCOUNT}. Регион: Московская область.\n"
+    "Ниши: кровля, фасады, капремонт МКД, ФКР МО.\n"
+    "Цель: 1 млн подписчиков за 12 месяцев через 30 сателлитных аккаунтов.\n"
+    "Аудитория русскоязычная. Стиль живой, экспертный, без канцелярита.\n"
+    f"Всегда добавляй призыв подписаться на {MAIN_ACCOUNT} в конце.\n"
+    "Алгоритм Instagram 2025-2026: семантика важнее хэштегов, закладки = главный сигнал охвата."
+)
 
-# ── AI ───────────────────────────────────────────────────────────
-def call_ai(messages: list, max_tokens=3000) -> str:
-    r = requests.post(
-        AI_BASE_URL,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {AI_API_KEY}",
-            "anthropic-version": "2023-06-01"
-        },
-        json={"model": AI_MODEL, "max_tokens": max_tokens,
-              "system": SYSTEM_PROMPT, "messages": messages},
-        timeout=90
-    )
-    r.raise_for_status()
-    return r.json()["content"][0]["text"]
+# ─────────────────────────── ИИ ───────────────────────────
+def call_ai(messages, max_tokens=2500):
+    """Запрос к ИИ. Возвращает текст или сообщение об ошибке."""
+    if not AI_API_KEY:
+        return "❌ AI_API_KEY не задан в настройках Railway."
+    try:
+        resp = requests.post(
+            AI_BASE_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {AI_API_KEY}",
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": AI_MODEL,
+                "max_tokens": max_tokens,
+                "system": SYSTEM_PROMPT,
+                "messages": messages,
+            },
+            timeout=90,
+        )
+        if resp.status_code != 200:
+            return f"❌ Ошибка API ({resp.status_code}): {resp.text[:200]}"
+        data = resp.json()
+        return data["content"][0]["text"]
+    except requests.exceptions.Timeout:
+        return "❌ Превышено время ожидания ответа ИИ. Попробуйте ещё раз."
+    except Exception as exc:
+        return f"❌ Ошибка: {exc}"
 
-def ai(prompt: str, max_tokens=3000) -> str:
+
+def ai(prompt, max_tokens=2500):
     return call_ai([{"role": "user", "content": prompt}], max_tokens)
 
-# ── FFMPEG HELPERS ───────────────────────────────────────────────
-def run_ffmpeg(args: list) -> bool:
+
+# ─────────────────────────── FFMPEG ───────────────────────────
+def ffmpeg(args):
     try:
-        result = subprocess.run(
-            ["ffmpeg", "-y"] + args,
-            capture_output=True, text=True, timeout=300
-        )
-        return result.returncode == 0
-    except Exception as e:
-        print(f"FFmpeg error: {e}")
+        r = subprocess.run(["ffmpeg", "-y"] + args, capture_output=True, timeout=300)
+        return r.returncode == 0
+    except Exception as exc:
+        print(f"FFmpeg error: {exc}")
         return False
 
-def get_video_duration(path: str) -> float:
+
+def video_duration(path):
     try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_format", path],
-            capture_output=True, text=True, timeout=30
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
+            capture_output=True, text=True, timeout=30,
         )
-        data = json.loads(result.stdout)
-        return float(data["format"]["duration"])
-    except:
+        return float(json.loads(r.stdout)["format"]["duration"])
+    except Exception:
         return 60.0
 
-def transcribe_video(path: str) -> str:
-    """Transcribe using Whisper if available, else return placeholder"""
-    try:
-        result = subprocess.run(
-            ["whisper", path, "--language", "ru", "--output_format", "txt",
-             "--output_dir", str(WORK_DIR), "--model", "base"],
-            capture_output=True, text=True, timeout=180
-        )
-        txt_file = WORK_DIR / (Path(path).stem + ".txt")
-        if txt_file.exists():
-            return txt_file.read_text(encoding="utf-8")
-    except:
-        pass
-    return ""
 
-def cut_segment(input_path: str, output_path: str, start: float, end: float) -> bool:
-    """Cut video segment"""
-    duration = end - start
-    return run_ffmpeg([
-        "-ss", str(start),
-        "-i", input_path,
-        "-t", str(duration),
-        "-c:v", "libx264", "-preset", "fast",
-        "-c:a", "aac", "-b:a", "128k",
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-        output_path
-    ])
-
-def add_subtitles(input_path: str, output_path: str, subs: list) -> bool:
-    """Add burned-in subtitles to video"""
-    # Create SRT file
-    srt_path = input_path.replace(".mp4", ".srt")
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for i, (start, end, text) in enumerate(subs, 1):
-            f.write(f"{i}\n")
-            f.write(f"{fmt_time(start)} --> {fmt_time(end)}\n")
-            f.write(f"{text}\n\n")
-
-    # Burn subtitles
-    ok = run_ffmpeg([
-        "-i", input_path,
-        "-vf", f"subtitles={srt_path}:force_style='FontName=Arial,FontSize=18,Bold=1,"
-               f"PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,"
-               f"Alignment=2,MarginV=80'",
-        "-c:a", "copy",
-        output_path
-    ])
-    try: os.remove(srt_path)
-    except: pass
-    return ok
-
-def add_cta_overlay(input_path: str, output_path: str, cta_text: str) -> bool:
-    """Add CTA text overlay in last 3 seconds"""
-    duration = get_video_duration(input_path)
-    cta_start = max(0, duration - 3)
-    safe_cta = cta_text.replace("'", "\\'").replace(":", "\\:")
-    return run_ffmpeg([
-        "-i", input_path,
-        "-vf", f"drawtext=text='{safe_cta}':fontcolor=white:fontsize=24:"
-               f"box=1:boxcolor=black@0.6:boxborderw=8:"
-               f"x=(w-text_w)/2:y=h-100:"
-               f"enable='between(t,{cta_start},{duration})'",
-        "-c:a", "copy",
-        output_path
-    ])
-
-def uniquify(input_path: str, output_path: str, variant: int) -> bool:
-    """Uniquify video for each account (change bitrate slightly)"""
-    bitrates = [2800, 2900, 3000, 3100, 3200]
-    crops = ["1080:1918:0:1", "1080:1918:0:2", "1080:1920:0:0",
-             "1078:1920:1:0", "1080:1918:0:0"]
-    br = bitrates[variant % len(bitrates)]
-    crop = crops[variant % len(crops)]
-    return run_ffmpeg([
-        "-i", input_path,
-        "-vf", f"crop={crop}",
-        "-c:v", "libx264", "-b:v", f"{br}k",
-        "-c:a", "aac", "-b:a", "128k",
-        output_path
-    ])
-
-def fmt_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
+def srt_timestamp(sec):
+    h, m = int(sec // 3600), int((sec % 3600) // 60)
+    s, ms = int(sec % 60), int((sec % 1) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-# ── ACCESS ───────────────────────────────────────────────────────
-def allowed(update: Update) -> bool:
+
+def cut_segment(src, dst, start, end):
+    return ffmpeg([
+        "-ss", str(start), "-i", src, "-t", str(end - start),
+        "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", "-b:a", "128k",
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        dst,
+    ])
+
+
+def burn_subtitles(src, dst, subs):
+    srt = src.replace(".mp4", ".srt")
+    with open(srt, "w", encoding="utf-8") as f:
+        for i, (start, end, text) in enumerate(subs, 1):
+            f.write(f"{i}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{text}\n\n")
+    style = ("FontName=Arial,FontSize=18,Bold=1,PrimaryColour=&HFFFFFF,"
+             "OutlineColour=&H000000,Outline=2,Alignment=2,MarginV=80")
+    ok = ffmpeg(["-i", src, "-vf", f"subtitles={srt}:force_style='{style}'",
+                 "-c:a", "copy", dst])
+    try:
+        os.remove(srt)
+    except OSError:
+        pass
+    return ok
+
+
+def add_cta(src, dst, text):
+    dur = video_duration(src)
+    start = max(0, dur - 3)
+    safe = text.replace("'", r"\'").replace(":", r"\:")
+    return ffmpeg([
+        "-i", src,
+        "-vf", (f"drawtext=text='{safe}':fontcolor=white:fontsize=24:box=1:"
+                f"boxcolor=black@0.6:boxborderw=8:x=(w-text_w)/2:y=h-100:"
+                f"enable='between(t,{start},{dur})'"),
+        "-c:a", "copy", dst,
+    ])
+
+
+def uniquify(src, dst, variant):
+    bitrates = [2800, 2900, 3000, 3100, 3200]
+    return ffmpeg([
+        "-i", src, "-c:v", "libx264", "-b:v", f"{bitrates[variant % 5]}k",
+        "-c:a", "aac", "-b:a", "128k", dst,
+    ])
+
+
+# ─────────────────────────── ДОСТУП ───────────────────────────
+def allowed(update):
     return ALLOWED_USER == 0 or update.effective_user.id == ALLOWED_USER
 
-# ── SEND HELPERS ─────────────────────────────────────────────────
-async def send_long(update: Update, text: str, reply_markup=None, parse_mode=None):
-    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-    for i, chunk in enumerate(chunks):
-        kb = reply_markup if i == len(chunks) - 1 else None
-        await update.effective_message.reply_text(chunk, reply_markup=kb, parse_mode=parse_mode)
 
-async def progress(msg, text: str):
-    try:
-        await msg.edit_text(text)
-    except:
-        pass
+# ─────────────────────────── ОТПРАВКА ───────────────────────────
+async def send_long(message, text, markup=None):
+    """Отправляет длинный текст частями (лимит Telegram 4096)."""
+    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [text]
+    for idx, chunk in enumerate(chunks):
+        kb = markup if idx == len(chunks) - 1 else None
+        await message.reply_text(chunk, reply_markup=kb)
 
-# ── KEYBOARDS ────────────────────────────────────────────────────
+
+# ─────────────────────────── КЛАВИАТУРЫ ───────────────────────────
 def kb_main():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 Сценарий Reels",    callback_data="c_scenario"),
-         InlineKeyboardButton("🎣 Хуки",              callback_data="c_hook")],
-        [InlineKeyboardButton("✍️ SEO Caption",        callback_data="c_caption"),
-         InlineKeyboardButton("👆 CTA блок",           callback_data="c_cta")],
-        [InlineKeyboardButton("📅 Контент-план",       callback_data="c_plan"),
-         InlineKeyboardButton("🎵 Промпт Suno",        callback_data="c_suno")],
-        [InlineKeyboardButton("📤 Пакет SMMplanner",   callback_data="c_smm"),
-         InlineKeyboardButton("🛡 Антидубль",          callback_data="c_antidupe")],
-        [InlineKeyboardButton("🔄 Очистить историю",   callback_data="c_clear")],
+        [InlineKeyboardButton("🎬 Сценарий Reels", callback_data="m:scenario"),
+         InlineKeyboardButton("🎣 Хуки", callback_data="m:hook")],
+        [InlineKeyboardButton("✍️ SEO Caption", callback_data="m:caption"),
+         InlineKeyboardButton("👆 CTA блок", callback_data="m:cta")],
+        [InlineKeyboardButton("📅 Контент-план", callback_data="m:plan"),
+         InlineKeyboardButton("🎵 Промпт Suno", callback_data="m:suno")],
+        [InlineKeyboardButton("📤 Пакет SMMplanner", callback_data="m:smm"),
+         InlineKeyboardButton("🛡 Антидубль", callback_data="m:antidupe")],
+        [InlineKeyboardButton("🔄 Очистить историю", callback_data="m:clear")],
     ])
 
-def kb_themes(pfx: str):
+
+def kb_back():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="m:back")]])
+
+
+def kb_themes(prefix):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏠 Кровля МКД",        callback_data=f"{pfx}|roof"),
-         InlineKeyboardButton("🏢 Фасады",            callback_data=f"{pfx}|facade")],
-        [InlineKeyboardButton("🔨 Капремонт МКД",     callback_data=f"{pfx}|kaprem"),
-         InlineKeyboardButton("💡 Лайфхаки",          callback_data=f"{pfx}|life")],
-        [InlineKeyboardButton("📸 До и после",        callback_data=f"{pfx}|before"),
-         InlineKeyboardButton("❌ Ошибки подрядчика", callback_data=f"{pfx}|errors")],
-        [InlineKeyboardButton("◀️ Назад",             callback_data="back")],
+        [InlineKeyboardButton("🏠 Кровля МКД", callback_data=f"{prefix}:roof"),
+         InlineKeyboardButton("🏢 Фасады", callback_data=f"{prefix}:facade")],
+        [InlineKeyboardButton("🔨 Капремонт МКД", callback_data=f"{prefix}:kaprem"),
+         InlineKeyboardButton("💡 Лайфхаки", callback_data=f"{prefix}:life")],
+        [InlineKeyboardButton("📸 До и после", callback_data=f"{prefix}:before"),
+         InlineKeyboardButton("❌ Ошибки", callback_data=f"{prefix}:errors")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="m:back")],
     ])
 
-def kb_dur(pfx: str):
+
+def kb_duration():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("15 сек", callback_data=f"{pfx}|15"),
-         InlineKeyboardButton("30 сек", callback_data=f"{pfx}|30"),
-         InlineKeyboardButton("60 сек", callback_data=f"{pfx}|60")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")],
+        [InlineKeyboardButton("15 сек", callback_data="dur:15"),
+         InlineKeyboardButton("30 сек", callback_data="dur:30"),
+         InlineKeyboardButton("60 сек", callback_data="dur:60")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="m:back")],
     ])
+
 
 def kb_reels_count():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("3 ролика",  callback_data="rc|3"),
-         InlineKeyboardButton("5 роликов", callback_data="rc|5"),
-         InlineKeyboardButton("8 роликов", callback_data="rc|8")],
+        [InlineKeyboardButton("3 ролика", callback_data="rc:3"),
+         InlineKeyboardButton("5 роликов", callback_data="rc:5"),
+         InlineKeyboardButton("8 роликов", callback_data="rc:8")],
     ])
 
+
 THEMES = {
-    "roof":   "Замена кровли МКД",
+    "roof": "Замена кровли МКД",
     "facade": "Фасадные работы МКД",
     "kaprem": "Капитальный ремонт по программе ФКР МО",
-    "life":   "Строительные лайфхаки",
+    "life": "Строительные лайфхаки",
     "before": "До и после объекта",
-    "errors": "Ошибки подрядчиков",
+    "errors": "Ошибки подрядчиков — разбор кейса",
 }
 
-# ── SESSION ──────────────────────────────────────────────────────
+# ─────────────────────────── СЕССИИ ───────────────────────────
 sessions = {}
 
-def sess(uid):
-    if uid not in sessions:
-        sessions[uid] = {
-            "history": [], "last_media": "",
-            "pending_video": None, "pending_action": None
-        }
-    return sessions[uid]
 
-# ── MAIN VIDEO PIPELINE ──────────────────────────────────────────
-async def run_pipeline(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                       video_path: str, num_reels: int, caption_txt: str):
-    uid = update.effective_user.id
-    s = sess(uid)
-    msg = await update.effective_message.reply_text("⚙️ *Запускаю полный автопилот...*", parse_mode=ParseMode.MARKDOWN)
+def get_session(uid):
+    return sessions.setdefault(uid, {"history": [], "media": "", "video": None})
+
+
+# ─────────────────────────── ВИДЕО-ПАЙПЛАЙН ───────────────────────────
+async def run_pipeline(message, video_path, num_reels):
+    status = await message.reply_text("⚙️ Запускаю автопилот...")
+
+    async def upd(text):
+        try:
+            await status.edit_text(text)
+        except Exception:
+            pass
 
     try:
-        # STEP 1: Get duration
-        await progress(msg, "📏 *Шаг 1/7* — Определяю длину видео...")
-        duration = get_video_duration(video_path)
-        dur_str = f"{int(duration//60)}:{int(duration%60):02d}"
+        await upd("📏 Шаг 1/5 — анализирую видео...")
+        dur = video_duration(video_path)
 
-        # STEP 2: Transcribe
-        await progress(msg, "🎙 *Шаг 2/7* — Транскрибирую речь (Whisper)...")
-        transcript = transcribe_video(video_path)
-        if not transcript:
-            transcript = f"Видео {dur_str}. {caption_txt or 'Строительный контент.'}"
-
-        # STEP 3: AI analysis - get timecodes and content
-        await progress(msg, "🤖 *Шаг 3/7* — ИИ анализирует и планирует нарезку...")
-
-        analysis_prompt = f"""Проанализируй видео и создай план нарезки на {num_reels} Instagram Reels.
-
-Длина видео: {dur_str} ({int(duration)} сек).
-Описание/транскрипт: {transcript[:1000]}
-
-Ответь СТРОГО в JSON формате (только JSON, без пояснений):
-{{
-  "reels": [
-    {{
-      "n": 1,
-      "start": 0.0,
-      "end": 28.0,
-      "hook": "Текст хука для первых 3 сек",
-      "title": "Название ролика",
-      "subtitles": [
-        {{"s": 0.0, "e": 3.0, "t": "Текст субтитра"}},
-        {{"s": 3.0, "e": 8.0, "t": "Следующий субтитр"}}
-      ],
-      "caption": "SEO-caption для этого ролика с хуком, текстом, вопросом, CTA на @workhab и 3-5 хэштегами"
-    }}
-  ]
-}}
-
-Тайм-коды должны быть в пределах {int(duration)} сек. Каждый ролик 15-60 сек."""
-
-        raw = ai(analysis_prompt, max_tokens=3000)
-
-        # Parse JSON
+        await upd("🤖 Шаг 2/5 — ИИ планирует нарезку...")
+        plan_prompt = (
+            f"Видео {int(dur)} сек. Составь план нарезки на {num_reels} Reels. "
+            "Ответь ТОЛЬКО валидным JSON без пояснений:\n"
+            '{"reels":[{"n":1,"start":0.0,"end":28.0,'
+            '"hook":"текст хука","title":"название",'
+            '"subtitles":[{"s":0.0,"e":3.0,"t":"субтитр"}],'
+            f'"caption":"caption с CTA на {MAIN_ACCOUNT} и хэштегами"}}]}}'
+            f"\nТайм-коды в пределах {int(dur)} сек, каждый ролик 15-60 сек."
+        )
+        raw = ai(plan_prompt)
         try:
-            start_idx = raw.find("{")
-            end_idx = raw.rfind("}") + 1
-            plan = json.loads(raw[start_idx:end_idx])
-            reels_plan = plan["reels"]
-        except:
-            # Fallback: equal segments
-            seg = duration / num_reels
-            reels_plan = []
+            plan = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+            reels = plan["reels"]
+        except Exception:
+            seg = dur / num_reels
             hooks = [
-                "Вы не поверите что здесь было раньше...",
+                "Вы не поверите что здесь было раньше",
                 "Эту ошибку делает каждый второй подрядчик",
-                "45 дней — и дом не узнать",
-                "Смотрите что происходит когда...",
-                "Никогда не делайте вот это на стройке"
+                "45 дней и дом не узнать",
+                "Смотрите что происходит когда экономят",
+                "Никогда не делайте так на стройке",
+                "Вот почему важен правильный подрядчик",
+                "Этого вы точно не знали о капремонте",
+                "Результат который удивил даже нас",
             ]
+            reels = []
             for i in range(num_reels):
-                st = i * seg
-                en = min((i + 1) * seg, duration - 0.5)
-                reels_plan.append({
-                    "n": i+1,
-                    "start": round(st, 1),
-                    "end": round(en, 1),
+                st = round(i * seg, 1)
+                en = round(min((i + 1) * seg, dur - 0.5), 1)
+                reels.append({
+                    "n": i + 1, "start": st, "end": en,
                     "hook": hooks[i % len(hooks)],
-                    "title": f"Ролик {i+1} — строительный контент",
+                    "title": f"Ролик {i + 1}",
                     "subtitles": [
-                        {"s": st, "e": st+4, "t": hooks[i % len(hooks)]},
-                        {"s": st+4, "e": en-3, "t": "Капремонт МКД · Московская область"},
-                        {"s": en-3, "e": en, "t": "Подписывайся → @workhab"}
+                        {"s": st, "e": st + 4, "t": hooks[i % len(hooks)]},
+                        {"s": st + 4, "e": en - 3, "t": "Капремонт МКД · Московская область"},
+                        {"s": en - 3, "e": en, "t": f"Подписывайся → {MAIN_ACCOUNT}"},
                     ],
-                    "caption": f"Строительный контент от @workhab 🏗\n\nКапремонт МКД в Московской области.\n\nСохрани 🔖 — пригодится!\n💬 Был такой случай? Пиши!\n➡️ @workhab\n\n#капремонт #кровля #фасад #мко #строительство"
+                    "caption": (
+                        f"Строительный контент от {MAIN_ACCOUNT}\n\n"
+                        "Капремонт МКД в Московской области.\n\n"
+                        "Сохрани 🔖 — пригодится!\n"
+                        "💬 Был такой случай? Пиши в комментах!\n"
+                        f"➡️ {MAIN_ACCOUNT}\n\n"
+                        "#капремонт #кровля #фасад #мкд #строительство"
+                    ),
                 })
 
-        total = len(reels_plan)
-        result_files = []
-        captions_text = []
+        work = WORK_DIR / f"job_{message.chat_id}"
+        work.mkdir(exist_ok=True)
+        results, captions = [], []
+        total = len(reels)
 
-        # STEP 4: Cut segments
-        await progress(msg, f"✂️ *Шаг 4/7* — Нарезаю {total} роликов...")
-        raw_dir = WORK_DIR / f"raw_{uid}"
-        raw_dir.mkdir(exist_ok=True)
-
-        for reel in reels_plan:
+        for reel in reels:
             n = reel["n"]
-            out = str(raw_dir / f"reel_{n}_raw.mp4")
-            await progress(msg, f"✂️ *Шаг 4/7* — Нарезаю ролик {n}/{total}...")
-            ok = cut_segment(video_path, out, reel["start"], reel["end"])
-            if ok:
-                reel["raw_path"] = out
-            else:
-                reel["raw_path"] = None
-
-        # STEP 5: Add subtitles
-        await progress(msg, f"💬 *Шаг 5/7* — Накладываю субтитры...")
-        sub_dir = WORK_DIR / f"sub_{uid}"
-        sub_dir.mkdir(exist_ok=True)
-
-        for reel in reels_plan:
-            n = reel["n"]
-            if not reel.get("raw_path"):
+            await upd(f"✂️ Шаг 3/5 — нарезаю ролик {n}/{total}...")
+            raw_path = str(work / f"r{n}_raw.mp4")
+            if not cut_segment(video_path, raw_path, reel["start"], reel["end"]):
                 continue
-            await progress(msg, f"💬 *Шаг 5/7* — Субтитры ролик {n}/{total}...")
+
+            await upd(f"💬 Шаг 4/5 — субтитры {n}/{total}...")
             subs = [(s["s"] - reel["start"], s["e"] - reel["start"], s["t"])
                     for s in reel.get("subtitles", [])]
-            out = str(sub_dir / f"reel_{n}_sub.mp4")
-            ok = add_subtitles(reel["raw_path"], out, subs)
-            reel["sub_path"] = out if ok else reel["raw_path"]
+            sub_path = str(work / f"r{n}_sub.mp4")
+            if not burn_subtitles(raw_path, sub_path, subs):
+                sub_path = raw_path
 
-        # STEP 6: Add CTA overlay
-        await progress(msg, "🎯 *Шаг 6/7* — Добавляю CTA...")
-        cta_dir = WORK_DIR / f"cta_{uid}"
-        cta_dir.mkdir(exist_ok=True)
+            await upd(f"🎯 Шаг 5/5 — CTA + финал {n}/{total}...")
+            cta_path = str(work / f"r{n}_cta.mp4")
+            if not add_cta(sub_path, cta_path, f"Подписывайся {MAIN_ACCOUNT}"):
+                cta_path = sub_path
 
-        for reel in reels_plan:
-            n = reel["n"]
-            if not reel.get("sub_path"):
-                continue
-            out = str(cta_dir / f"reel_{n}_final.mp4")
-            ok = add_cta_overlay(reel["sub_path"], out, "Подписывайся → @workhab")
-            reel["final_path"] = out if ok else reel["sub_path"]
+            final_path = str(work / f"r{n}_final.mp4")
+            if not uniquify(cta_path, final_path, n):
+                final_path = cta_path
 
-        # STEP 7: Uniquify for accounts + collect results
-        await progress(msg, "🛡 *Шаг 7/7* — Уникализирую для аккаунтов...")
-        final_dir = WORK_DIR / f"final_{uid}"
-        final_dir.mkdir(exist_ok=True)
-
-        for reel in reels_plan:
-            n = reel["n"]
-            if not reel.get("final_path"):
-                continue
-            # Create 2 unique versions (main + satellite example)
-            for v in range(2):
-                out = str(final_dir / f"reel_{n}_v{v+1}.mp4")
-                ok = uniquify(reel["final_path"], out, v)
-                if ok and v == 0:
-                    result_files.append((out, n, reel.get("title", f"Ролик {n}")))
-
-            captions_text.append(
-                f"━━━ *РОЛИК {n}: {reel.get('title','')}* ━━━\n\n"
-                f"🎣 *Хук:* {reel.get('hook','')}\n\n"
-                f"📝 *Caption:*\n{reel.get('caption','')}"
+            results.append((final_path, n, reel.get("title", f"Ролик {n}")))
+            captions.append(
+                f"━━━ РОЛИК {n}: {reel.get('title', '')} ━━━\n\n"
+                f"🎣 Хук: {reel.get('hook', '')}\n\n"
+                f"📝 Caption:\n{reel.get('caption', '')}"
             )
 
-        # SEND RESULTS
-        await msg.delete()
+        await status.delete()
 
-        if not result_files:
-            await update.effective_message.reply_text(
-                "❌ Что-то пошло не так при обработке видео.\n"
-                "Убедитесь что FFmpeg установлен на сервере.",
-                reply_markup=kb_main()
+        if not results:
+            await message.reply_text(
+                "❌ Не удалось обработать видео. Проверьте формат файла.",
+                reply_markup=kb_main(),
             )
             return
 
-        # Send video files
-        await update.effective_message.reply_text(
-            f"✅ *Готово! {len(result_files)} роликов обработано*\n\n"
-            f"Отправляю файлы...",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await message.reply_text(f"✅ Готово! Обработано роликов: {len(results)}")
 
-        for file_path, n, title in result_files:
+        for path, n, title in results:
             try:
-                with open(file_path, "rb") as f:
-                    await update.effective_message.reply_video(
-                        f,
-                        caption=f"🎬 Ролик {n}: {title}\n✅ Субтитры + CTA + Антидубль v1",
-                        supports_streaming=True
+                with open(path, "rb") as vf:
+                    await message.reply_video(
+                        vf,
+                        caption=f"🎬 Ролик {n}: {title}\n✅ Субтитры + CTA + Антидубль",
+                        supports_streaming=True,
                     )
-            except Exception as e:
-                await update.effective_message.reply_text(f"⚠️ Ролик {n} — ошибка отправки: {e}")
+            except Exception as exc:
+                await message.reply_text(f"⚠️ Ролик {n}: ошибка отправки ({exc})")
 
-        # Send captions
-        caption_full = "\n\n".join(captions_text)
-        await send_long(update, caption_full, parse_mode=ParseMode.MARKDOWN)
-
-        # Final instructions
-        await update.effective_message.reply_text(
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "📤 *СЛЕДУЮЩИЕ ШАГИ:*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "1️⃣ Скачай готовые MP4 из чата\n"
-            "2️⃣ Зайди на *smmplanner.com*\n"
-            "3️⃣ Создай пост → выбери аккаунты\n"
-            "4️⃣ Загрузи видео + вставь caption\n"
-            "5️⃣ Запланируй время → Готово! 🚀\n\n"
-            "Для второй версии (антидубль v2) — нажми /reprocess",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_main()
+        await send_long(message, "\n\n".join(captions))
+        await message.reply_text(
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📤 ДАЛЬШЕ:\n"
+            "1. Скачай готовые MP4 выше\n"
+            "2. Зайди на smmplanner.com\n"
+            "3. Создай пост → выбери аккаунты\n"
+            "4. Загрузи видео + вставь caption\n"
+            "5. Запланируй время 🚀",
+            reply_markup=kb_main(),
         )
+    except Exception as exc:
+        await upd(f"❌ Ошибка обработки: {exc}")
 
-        # Cleanup
-        s["last_media"] = caption_txt or f"видео {dur_str}"
 
-    except Exception as e:
-        await msg.edit_text(
-            f"❌ Ошибка обработки: {e}\n\n"
-            "Убедитесь что FFmpeg установлен:\n`apt-get install ffmpeg`",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_main()
-        )
-
-# ── COMMAND HANDLERS ─────────────────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
+# ─────────────────────────── ОБРАБОТЧИКИ ───────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
     await update.message.reply_text(
-        "👋 *Привет, Виктор!*\n\n"
-        "Я — *полный автопилот* контент-завода 🏗\n\n"
-        "*Просто отправь видео с объекта:*\n"
-        "📹 Загрузи видео → я автоматически:\n"
-        "  ✂️ Нарежу на Reels по тайм-кодам\n"
-        "  💬 Наложу субтитры\n"
-        "  🎯 Добавлю CTA @workhab\n"
-        "  🛡 Уникализирую для аккаунтов\n"
-        "  ✍️ Напишу caption для каждого\n"
-        "  📤 Верну готовые MP4 файлы\n\n"
-        "*Требования к видео:*\n"
-        "• Размер до 50 МБ\n"
-        "• Форматы: MP4, MOV, AVI\n"
-        "• Горизонтальное или вертикальное\n\n"
-        "Или нажми кнопку для текстового контента 👇",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_main()
+        "👋 Привет! Я бот контент-завода WorkHab 🏗\n\n"
+        "📹 Отправь видео с объекта → я автоматически:\n"
+        "  ✂️ нарежу на Reels\n"
+        "  💬 наложу субтитры\n"
+        f"  🎯 добавлю CTA на {MAIN_ACCOUNT}\n"
+        "  🛡 уникализирую файлы\n"
+        "  ✍️ напишу caption\n\n"
+        "📸 Отправь фото → дам хуки, caption и CTA\n\n"
+        "✍️ Или напиши вопрос текстом\n\n"
+        "Можно нажать кнопку ниже 👇",
+        reply_markup=kb_main(),
     )
 
-async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
-    uid = update.effective_user.id
-    s = sess(uid)
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    s = get_session(update.effective_user.id)
+    await update.message.chat.send_action(ChatAction.TYPING)
+    s["history"].append({"role": "user", "content": update.message.text})
+    reply = call_ai(s["history"][-20:])
+    s["history"].append({"role": "assistant", "content": reply})
+    await send_long(update.message, reply, kb_main())
+
+
+async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    s = get_session(update.effective_user.id)
     video = update.message.video or update.message.document
-    caption_txt = update.message.caption or ""
-
-    msg = await update.message.reply_text(
-        "📥 *Видео получено!*\nСколько Reels нарезать?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_reels_count()
-    )
-
-    # Download video
-    await update.message.chat.send_action("upload_video")
+    await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
+    msg = await update.message.reply_text("📥 Загружаю видео...")
     try:
-        file = await ctx.bot.get_file(video.file_id)
-        video_path = str(WORK_DIR / f"input_{uid}.mp4")
-        await file.download_to_drive(video_path)
-        s["pending_video"] = video_path
-        s["pending_caption"] = caption_txt
-    except Exception as e:
-        await msg.edit_text(f"❌ Ошибка загрузки: {e}")
+        tg_file = await ctx.bot.get_file(video.file_id)
+        path = str(WORK_DIR / f"in_{update.effective_user.id}.mp4")
+        await tg_file.download_to_drive(path)
+        s["video"] = path
+        await msg.edit_text("📥 Видео загружено! Сколько Reels нарезать?",
+                            reply_markup=kb_reels_count())
+    except Exception as exc:
+        await msg.edit_text(f"❌ Ошибка загрузки: {exc}")
 
-async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
-    uid = update.effective_user.id
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
     caption = update.message.caption or ""
-    msg = await update.message.reply_text("📸 Генерирую контент-пакет для фото...")
-    try:
-        reply = ai(f"""Фото с объекта. {caption}
+    await update.message.chat.send_action(ChatAction.TYPING)
+    msg = await update.message.reply_text("📸 Генерирую контент-пакет...")
+    reply = ai(
+        f"Фото с объекта. {caption}\n\n"
+        "Дай пакет:\n"
+        "🎣 5 ХУКОВ (первые 2-3 сек Reels)\n"
+        "✍️ SEO-CAPTION (хук, текст, вопрос, CTA, хэштеги)\n"
+        f"👆 CTA-БЛОК (закладки + комментарий + {MAIN_ACCOUNT})\n"
+        "📋 ЗАДАНИЕ МОНТАЖЁРУ (шаги в CapCut)\n"
+        "🎵 ПРОМПТ SUNO AI (без авторских прав)"
+    )
+    await msg.delete()
+    await send_long(update.message, reply, kb_main())
 
-Сделай полный пакет:
-🎣 5 ЦЕПЛЯЮЩИХ ХУКОВ (первые 2-3 сек Reels)
-✍️ SEO-CAPTION (хук → текст → вопрос → CTA → хэштеги)
-👆 CTA-БЛОК (закладки + комментарий + @workhab)
-📋 ЗАДАНИЕ МОНТАЖЁРУ (конкретные шаги в CapCut)
-🎵 ПРОМПТ SUNO AI (музыка без авторских прав)
 
-Русскоязычная строительная аудитория.""")
-        await msg.delete()
-        await send_long(update, reply, reply_markup=kb_main())
-    except Exception as e:
-        await msg.edit_text(f"❌ {e}", reply_markup=kb_main())
-
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
-    uid = update.effective_user.id
-    s = sess(uid)
-    text = update.message.text
-    await update.message.chat.send_action("typing")
-    s["history"].append({"role": "user", "content": text})
-    try:
-        reply = call_ai(s["history"][-20:])
-        s["history"].append({"role": "assistant", "content": reply})
-        await send_long(update, reply, reply_markup=kb_main())
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}", reply_markup=kb_main())
-
-async def handle_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
     doc = update.message.document
     if doc and doc.mime_type and doc.mime_type.startswith("video"):
-        await handle_video(update, ctx)
+        await on_video(update, ctx)
     else:
         await update.message.reply_text("Отправь видео или фото!", reply_markup=kb_main())
 
-# ── BUTTON HANDLER ───────────────────────────────────────────────
-async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
+
+# ─────────────────────────── КНОПКИ ───────────────────────────
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
     q = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    s = sess(uid)
+    s = get_session(uid)
     data = q.data
+    kind, _, value = data.partition(":")
 
-    if data == "back":
+    # Навигация
+    if data == "m:back":
         await q.edit_message_reply_markup(reply_markup=kb_main())
         return
-
-    if data == "c_clear":
-        sessions[uid] = {"history":[], "last_media":"", "pending_video":None, "pending_action":None}
-        await q.edit_message_text("🔄 Очищено!", reply_markup=kb_main())
+    if data == "m:clear":
+        sessions[uid] = {"history": [], "media": "", "video": None}
+        await q.edit_message_text("🔄 История очищена!", reply_markup=kb_main())
         return
 
-    # Reels count selected
-    if data.startswith("rc|"):
-        num = int(data.split("|")[1])
-        video_path = s.get("pending_video")
-        caption_txt = s.get("pending_caption", "")
-        if not video_path or not Path(video_path).exists():
-            await q.edit_message_text("❌ Видео не найдено. Отправь видео заново.", reply_markup=kb_main())
+    # Меню, требующие выбора темы/длительности
+    if data == "m:scenario":
+        await q.edit_message_text("🎬 Длительность ролика:", reply_markup=kb_duration())
+        return
+    if data == "m:hook":
+        await q.edit_message_text("🎣 Выбери тему:", reply_markup=kb_themes("hook"))
+        return
+    if data == "m:caption":
+        await q.edit_message_text("✍️ Выбери тему:", reply_markup=kb_themes("cap"))
+        return
+
+    # Длительность выбрана → выбор темы
+    if kind == "dur":
+        ctx.user_data["dur"] = value
+        await q.edit_message_text(f"🎬 Reels {value} сек — выбери тему:",
+                                  reply_markup=kb_themes("scen"))
+        return
+
+    # Количество роликов выбрано → запуск пайплайна
+    if kind == "rc":
+        if not s.get("video") or not Path(s["video"]).exists():
+            await q.edit_message_text("❌ Видео не найдено. Отправь заново.",
+                                      reply_markup=kb_main())
             return
         await q.delete()
-        await run_pipeline(update, ctx, video_path, num, caption_txt)
+        await run_pipeline(q.message, s["video"], int(value))
         return
 
-    # Text content buttons
-    if data == "c_scenario":
-        await q.edit_message_text("🎬 Длительность:", reply_markup=kb_dur("scen"))
-        return
-    if data == "c_hook":
-        await q.edit_message_text("🎣 Тема:", reply_markup=kb_themes("hook"))
-        return
-    if data == "c_caption":
-        await q.edit_message_text("✍️ Тема:", reply_markup=kb_themes("cap"))
-        return
-
-    if data == "c_cta":
-        await q.edit_message_text("⏳ Генерирую CTA...")
-        try:
-            r = ai("Напиши 5 вариантов CTA для Instagram Reels строительной тематики. Типы: закладки, комментарий, репост, подписка, вопрос. Живой русский. Упомяни @workhab.")
-            await q.edit_message_text(r[:4000], reply_markup=kb_main())
-        except Exception as e:
-            await q.edit_message_text(f"❌ {e}", reply_markup=kb_main())
-        return
-
-    if data == "c_plan":
-        await q.edit_message_text("⏳ Генерирую контент-план...")
-        try:
-            r = ai("Составь контент-план на 2 недели для 30 Instagram аккаунтов строительной тематики МО. 4-5 постов/день. Reels 60%, карусели 30%, посты 10%. Дата, тема, формат, аккаунт, ссылка на @workhab.")
-            await q.edit_message_text(r[:4000])
-            if len(r) > 4000:
-                await update.effective_message.reply_text(r[4000:], reply_markup=kb_main())
-            else:
-                await update.effective_message.reply_text("✅", reply_markup=kb_main())
-        except Exception as e:
-            await q.edit_message_text(f"❌ {e}", reply_markup=kb_main())
-        return
-
-    if data == "c_suno":
-        await q.edit_message_text("⏳ Генерирую промпты Suno...")
-        try:
-            r = ai("Напиши 3 промпта для Suno AI под строительные Reels: 1) таймлапс 2) до/после 3) экспертный совет. Английский, без вокала, 30 сек, нет авторских прав.")
-            await q.edit_message_text(r[:4000], reply_markup=kb_main())
-        except Exception as e:
-            await q.edit_message_text(f"❌ {e}", reply_markup=kb_main())
-        return
-
-    if data == "c_smm":
-        await q.edit_message_text("⏳ Формирую пакет SMMplanner...")
-        media = s.get("last_media", "строительный контент")
-        try:
-            r = ai(f"Сформируй пакет для SMMplanner на 5 аккаунтов: @workhab, @roofmaster_msk, @fasad_pro_mo, @kaprem_mo, @stroylajfhak_ru. Контент: {media}. Для каждого: уникальный SEO-текст, CTA, 3-5 хэштегов. Время: 19:00 МСК.")
-            await q.edit_message_text(r[:4000])
-            if len(r) > 4000:
-                await update.effective_message.reply_text(r[4000:], reply_markup=kb_main())
-            else:
-                await update.effective_message.reply_text("✅ Копируй в SMMplanner!", reply_markup=kb_main())
-        except Exception as e:
-            await q.edit_message_text(f"❌ {e}", reply_markup=kb_main())
-        return
-
-    if data == "c_antidupe":
-        await q.edit_message_text("⏳ Генерирую инструкцию...")
-        try:
-            r = ai("Напиши краткую инструкцию как уникализировать видео для 30 Instagram аккаунтов через CloudConvert — уникальный MD5-хеш для каждого. Конкретные шаги.")
-            await q.edit_message_text(r[:4000], reply_markup=kb_main())
-        except Exception as e:
-            await q.edit_message_text(f"❌ {e}", reply_markup=kb_main())
-        return
-
-    # Duration for scenario
-    if data.startswith("scen|"):
-        dur = data.split("|")[1]
-        ctx.user_data["scen_dur"] = dur
-        await q.edit_message_text(f"🎬 Reels {dur} сек — тема:", reply_markup=kb_themes(f"scen_t_{dur}"))
-        return
-
-    # Theme selected
-    parts = data.split("|")
-    if len(parts) == 2:
-        action, theme_key = parts[0], parts[1]
-        theme = THEMES.get(theme_key, theme_key)
-
-        if action == "hook":
-            prompt = f"Напиши 8 цепляющих хуков для первых 2-3 сек Instagram Reels по теме '{theme}'. Остановить скролл намертво. Разные подходы: провокация, шок-факт, вопрос, обещание. Русскоязычная аудитория."
-        elif action == "cap":
-            prompt = f"Напиши SEO-caption для Instagram Reels по теме '{theme}'. Хук → SEO-текст → вопрос → CTA (🔖+💬+@workhab) → 3-5 хэштегов. До 250 слов."
-        elif action.startswith("scen_t_"):
-            dur = action.replace("scen_t_", "")
-            prompt = f"Детальный сценарий Reels {dur}сек, тема '{theme}'. Тайм-коды, субтитры, голос, текст на экране. Хук 0-3 сек. Финал: 🔖 Сохрани · @workhab."
+    # Прямые генерации без темы
+    direct = {
+        "m:cta": ("👆 Генерирую CTA...",
+                  "Напиши 5 вариантов CTA для Instagram Reels строительной "
+                  f"тематики: закладки, комментарий, репост, подписка, вопрос. "
+                  f"Живой русский. Призыв подписаться на {MAIN_ACCOUNT}."),
+        "m:plan": ("📅 Генерирую контент-план...",
+                   "Составь контент-план на 2 недели для 30 Instagram аккаунтов "
+                   "строительной тематики МО. 4-5 постов/день. Reels 60%, "
+                   f"карусели 30%, посты 10%. Дата, тема, формат, аккаунт, ссылка на {MAIN_ACCOUNT}."),
+        "m:suno": ("🎵 Генерирую промпты Suno...",
+                   "Напиши 3 промпта для Suno AI под строительные Reels: таймлапс, "
+                   "до/после, экспертный совет. На английском, без вокала, 30 сек, "
+                   "без проблем с авторскими правами."),
+        "m:smm": ("📤 Формирую пакет SMMplanner...",
+                  f"Сформируй пакет для SMMplanner на 5 аккаунтов: {MAIN_ACCOUNT}, "
+                  "@roofmaster_msk, @fasad_pro_mo, @kaprem_mo, @stroylajfhak_ru. "
+                  "Для каждого: уникальный SEO-текст, CTA, 3-5 хэштегов. Время 19:00 МСК."),
+        "m:antidupe": ("🛡 Генерирую инструкцию...",
+                       "Напиши краткую пошаговую инструкцию как уникализировать видео "
+                       "для 30 Instagram аккаунтов через CloudConvert — уникальный "
+                       "MD5-хеш для каждого. Конкретные шаги."),
+    }
+    if data in direct:
+        wait_text, prompt = direct[data]
+        await q.edit_message_text(wait_text)
+        reply = ai(prompt)
+        # edit_message_text не принимает длинный текст хорошо — отправим частями
+        if len(reply) <= 4000:
+            await q.edit_message_text(reply, reply_markup=kb_main())
         else:
-            return
+            await q.edit_message_text(reply[:4000])
+            await send_long(q.message, reply[4000:], kb_main())
+        return
 
-        await q.edit_message_text(f"⏳ Генерирую для темы: {theme}...")
-        try:
-            r = ai(prompt)
-            s["history"].append({"role":"user","content":prompt})
-            s["history"].append({"role":"assistant","content":r})
-            await q.edit_message_text(r[:4000])
-            if len(r) > 4000:
-                await update.effective_message.reply_text(r[4000:], reply_markup=kb_main())
-            else:
-                await update.effective_message.reply_text("Что дальше?", reply_markup=kb_main())
-        except Exception as e:
-            await q.edit_message_text(f"❌ {e}", reply_markup=kb_main())
+    # Тема выбрана
+    if kind in ("hook", "cap", "scen"):
+        theme = THEMES.get(value, value)
+        if kind == "hook":
+            prompt = (f"Напиши 8 цепляющих хуков для первых 2-3 секунд Instagram "
+                      f"Reels по теме '{theme}'. Остановить скролл. Русскоязычная аудитория.")
+        elif kind == "cap":
+            prompt = (f"Напиши SEO-caption для Instagram Reels по теме '{theme}'. "
+                      f"Хук, SEO-текст, вопрос к аудитории, CTA (закладки + комментарий "
+                      f"+ {MAIN_ACCOUNT}), 3-5 хэштегов. До 250 слов.")
+        else:  # scen
+            dur = ctx.user_data.get("dur", "30")
+            prompt = (f"Детальный сценарий Instagram Reels {dur} сек, тема '{theme}'. "
+                      f"Тайм-коды, субтитры, голос за кадром, текст на экране. "
+                      f"Хук 0-3 сек. Финал: сохрани + подписка на {MAIN_ACCOUNT}.")
+        await q.edit_message_text(f"⏳ Генерирую: {theme}...")
+        reply = ai(prompt)
+        s["history"].append({"role": "user", "content": prompt})
+        s["history"].append({"role": "assistant", "content": reply})
+        if len(reply) <= 4000:
+            await q.edit_message_text(reply, reply_markup=kb_main())
+        else:
+            await q.edit_message_text(reply[:4000])
+            await send_long(q.message, reply[4000:], kb_main())
+        return
 
-# ── MAIN ─────────────────────────────────────────────────────────
+
+# ─────────────────────────── ЗАПУСК ───────────────────────────
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN не задан!")
@@ -677,17 +555,18 @@ def main():
         print("❌ AI_API_KEY не задан!")
         return
 
-    print("🤖 Автопилот контент-завода запускается...")
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("help",   start))
-    app.add_handler(CallbackQueryHandler(button))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    print("✅ Бот запущен!")
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, on_video))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    print("✅ WorkHab бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
