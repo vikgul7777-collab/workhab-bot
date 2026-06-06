@@ -17,12 +17,12 @@ from telegram.ext import (
 from telegram.constants import ParseMode, ChatAction
 
 # ─────────────────────────── КОНФИГ ───────────────────────────
-BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
-AI_API_KEY   = os.getenv("AI_API_KEY", "")
-AI_BASE_URL  = os.getenv("AI_BASE_URL", "https://api.aitunnel.ru/v1/messages")
-AI_MODEL     = os.getenv("AI_MODEL", "claude-sonnet-4-6")
-ALLOWED_USER = int(os.getenv("ALLOWED_USER_ID", "0"))
-MAIN_ACCOUNT = os.getenv("MAIN_ACCOUNT", "@workhab")
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "").strip()
+AI_API_KEY   = os.getenv("AI_API_KEY", "").strip()
+AI_BASE_URL  = os.getenv("AI_BASE_URL", "https://api.aitunnel.ru/v1/messages").strip()
+AI_MODEL     = os.getenv("AI_MODEL", "claude-sonnet-4-6").strip()
+ALLOWED_USER = int(os.getenv("ALLOWED_USER_ID", "0").strip() or "0")
+MAIN_ACCOUNT = os.getenv("MAIN_ACCOUNT", "@workhab").strip()
 
 WORK_DIR = Path("/tmp/workhab")
 WORK_DIR.mkdir(exist_ok=True)
@@ -42,20 +42,35 @@ def call_ai(messages, max_tokens=2500):
     """Запрос к ИИ. Возвращает текст или сообщение об ошибке."""
     if not AI_API_KEY:
         return "❌ AI_API_KEY не задан в настройках Railway."
+
+    # Проверка что ключ и модель не содержат не-ASCII символов (частая причина ошибки latin-1)
+    try:
+        AI_API_KEY.encode("ascii")
+    except UnicodeEncodeError:
+        return ("❌ В API-ключе есть посторонние символы (возможно русские буквы "
+                "или скрытый пробел). Скопируйте ключ заново с aitunnel.ru.")
+    try:
+        AI_MODEL.encode("ascii")
+    except UnicodeEncodeError:
+        return "❌ В названии модели (AI_MODEL) посторонние символы. Должно быть: claude-sonnet-4-6"
+
+    # Тело запроса кодируем явно в UTF-8 и передаём как data, чтобы избежать latin-1
+    body = json.dumps({
+        "model": AI_MODEL,
+        "max_tokens": max_tokens,
+        "system": SYSTEM_PROMPT,
+        "messages": messages,
+    }, ensure_ascii=False).encode("utf-8")
+
     try:
         resp = requests.post(
             AI_BASE_URL,
             headers={
-                "Content-Type": "application/json",
+                "Content-Type": "application/json; charset=utf-8",
                 "Authorization": f"Bearer {AI_API_KEY}",
                 "anthropic-version": "2023-06-01",
             },
-            json={
-                "model": AI_MODEL,
-                "max_tokens": max_tokens,
-                "system": SYSTEM_PROMPT,
-                "messages": messages,
-            },
+            data=body,
             timeout=90,
         )
         if resp.status_code != 200:
@@ -65,7 +80,7 @@ def call_ai(messages, max_tokens=2500):
     except requests.exceptions.Timeout:
         return "❌ Превышено время ожидания ответа ИИ. Попробуйте ещё раз."
     except Exception as exc:
-        return f"❌ Ошибка: {exc}"
+        return f"❌ Ошибка запроса: {exc}"
 
 
 def ai(prompt, max_tokens=2500):
