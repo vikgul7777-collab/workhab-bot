@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "apt-get install -y ffmpeg && python bot.py",
+    "restartPolicyType": "ON_FAILURE"
+  }
+}
